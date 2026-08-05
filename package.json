@@ -1,0 +1,12 @@
+{
+  "name": "digi-gacha-lan-relay",
+  "version": "1.0.0",
+  "description": "Servidor de relay WebSocket para el PvP en red local de digi-gacha. No es parte de la app Ionic — corre aparte, en una PC de la misma red wifi.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}
