@@ -23,13 +23,24 @@
 //       usá la URL pública que te den en vez de una IP local.
 // ============================================================================
 
+const http = require('http');
 const WebSocket = require('ws');
 
 // Plataformas como Render/Railway asignan el puerto ellas mismas vía la
 // variable de entorno estándar PORT — hay que respetarla si está presente.
 // PUERTO queda como alternativa para cuando lo corrés vos a mano en LAN.
 const PUERTO = process.env.PORT || process.env.PUERTO || 8765;
-const wss = new WebSocket.Server({ port: PUERTO, host: '0.0.0.0' });
+
+// Servidor HTTP "de cortesía": el WebSocket real se cuelga de este mismo
+// servidor. Sin esto, un pedido HTTP normal (el health check de Render, o
+// alguien abriendo la URL en el navegador) se queda colgado sin respuesta,
+// y Render puede terminar marcando el servicio como caído y reiniciándolo.
+const servidorHttp = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('Relay de PvP activo. Conectate por WebSocket (wss://), no por HTTP.');
+});
+
+const wss = new WebSocket.Server({ server: servidorHttp });
 
 // codigoSala (string) -> { host: WebSocket|null, guest: WebSocket|null }
 const salas = new Map();
@@ -202,5 +213,8 @@ wss.on('connection', (ws) => {
   });
 });
 
-console.log(`[LAN Relay] Escuchando en el puerto ${PUERTO}.`);
-console.log('[LAN Relay] Los dispositivos deben conectarse a ws://<IP-de-esta-PC>:' + PUERTO);
+servidorHttp.listen(PUERTO, '0.0.0.0', () => {
+  console.log(`[Relay] Escuchando en el puerto ${PUERTO}.`);
+  console.log('[Relay] LAN: los dispositivos se conectan a ws://<IP-de-esta-PC>:' + PUERTO);
+  console.log('[Relay] Internet: los dispositivos se conectan a wss://<tu-dominio>, sin puerto.');
+});
