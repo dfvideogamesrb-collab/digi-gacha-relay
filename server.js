@@ -12,6 +12,12 @@
 // automático) y reenvía los mensajes entre sí. La lógica real de la batalla
 // vive en la app (battle-engine.service.ts), no acá.
 //
+// Reconexión: si a alguien se le corta el WebSocket (wifi que titila, la app
+// pasa a segundo plano, etc.), la sala NO se borra de una — queda
+// "reservada" GRACIA_RECONEXION_MS por si ese jugador vuelve a conectar con
+// el mismo código y rol (ver mensaje 'reconectar'). Si nadie reclama ese
+// lugar a tiempo, ahí sí se borra la sala y se avisa al que quedó.
+//
 // Cómo correrlo:
 //   1. cd lan-relay-server
 //   2. npm install
@@ -31,6 +37,10 @@ const WebSocket = require('ws');
 // PUERTO queda como alternativa para cuando lo corrés vos a mano en LAN.
 const PUERTO = process.env.PORT || process.env.PUERTO || 8765;
 
+// Cuánto tiempo se reserva el lugar de un jugador desconectado antes de
+// darlo por perdido y borrar la sala.
+const GRACIA_RECONEXION_MS = 45000;
+
 // Servidor HTTP "de cortesía": el WebSocket real se cuelga de este mismo
 // servidor. Sin esto, un pedido HTTP normal (el health check de Render, o
 // alguien abriendo la URL en el navegador) se queda colgado sin respuesta,
@@ -42,7 +52,7 @@ const servidorHttp = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ server: servidorHttp });
 
-// codigoSala (string) -> { host: WebSocket|null, guest: WebSocket|null }
+// codigoSala (string) -> { host: WebSocket|null, guest: WebSocket|null, timeoutLimpieza: Timeout|null }
 const salas = new Map();
 
 // Jugadores esperando matchmaking automático (cola FIFO simple: el primero
@@ -80,17 +90,39 @@ function obtenerRival(ws) {
   return null;
 }
 
-function limpiarSala(ws) {
+/**
+ * Se llama cuando un socket se cierra (por el motivo que sea). En vez de
+ * borrar la sala de una, deja ese lugar vacío y arranca un cronómetro de
+ * gracia — si el jugador vuelve a conectar con 'reconectar' antes de que
+ * se cumpla, retoma justo donde estaba. Si no, recién ahí se borra todo.
+ */
+function manejarDesconexion(ws) {
   const sala = salas.get(ws.codigoSala);
   if (!sala) return;
 
   const rival = obtenerRival(ws);
   enviar(rival, { type: 'rival_desconectado' });
 
-  // Por ahora, cualquier desconexión mata la sala entera (no hay reconexión
-  // en esta primera versión — si a futuro hace falta, acá es donde se
-  // agregaría un período de gracia antes de borrarla).
-  salas.delete(ws.codigoSala);
+  if (sala.host === ws) sala.host = null;
+  if (sala.guest === ws) sala.guest = null;
+
+  // Si ya había un cronómetro corriendo (por ejemplo, el otro jugador
+  // también se había caído antes), lo reiniciamos — total, mientras haya
+  // UN solo cronómetro activo por sala alcanza.
+  if (sala.timeoutLimpieza) clearTimeout(sala.timeoutLimpieza);
+
+  sala.timeoutLimpieza = setTimeout(() => {
+    const salaActual = salas.get(ws.codigoSala);
+    if (!salaActual) return;
+
+    const restante = salaActual.host || salaActual.guest;
+    if (restante) {
+      // Alguien se quedó esperando y el otro nunca volvió — le avisamos
+      // que ya no tiene sentido seguir esperando.
+      enviar(restante, { type: 'rival_desconectado_definitivo' });
+    }
+    salas.delete(ws.codigoSala);
+  }, GRACIA_RECONEXION_MS);
 }
 
 wss.on('connection', (ws) => {
@@ -111,7 +143,7 @@ wss.on('connection', (ws) => {
 
       case 'crear_sala': {
         const codigo = generarCodigoUnico();
-        salas.set(codigo, { host: ws, guest: null });
+        salas.set(codigo, { host: ws, guest: null, timeoutLimpieza: null });
         ws.codigoSala = codigo;
         ws.rol = 'host';
         enviar(ws, { type: 'sala_creada', codigo });
@@ -165,7 +197,7 @@ wss.on('connection', (ws) => {
 
         if (rival) {
           const codigo = generarCodigoUnico();
-          salas.set(codigo, { host: rival, guest: ws });
+          salas.set(codigo, { host: rival, guest: ws, timeoutLimpieza: null });
           rival.codigoSala = codigo;
           rival.rol = 'host';
           rival.enColaMatchmaking = false;
@@ -189,6 +221,41 @@ wss.on('connection', (ws) => {
         break;
       }
 
+      case 'reconectar': {
+        const codigo = (msg.codigo || '').toUpperCase().trim();
+        const sala = salas.get(codigo);
+
+        if (!sala) {
+          enviar(ws, { type: 'error', mensaje: 'La sala ya no existe (pasó demasiado tiempo sin reconectar).' });
+          return;
+        }
+
+        const rol = msg.rol === 'host' ? 'host' : 'guest';
+        if (sala[rol]) {
+          enviar(ws, { type: 'error', mensaje: 'Ese lugar ya está ocupado.' });
+          return;
+        }
+
+        sala[rol] = ws;
+        ws.codigoSala = codigo;
+        ws.rol = rol;
+
+        // Si el otro lugar también estaba vacío (los dos se cayeron a la
+        // vez), dejamos el cronómetro corriendo por si el otro también
+        // vuelve. Si ya está el rival, cancelamos el cronómetro: la sala
+        // está completa de nuevo.
+        const salaCompleta = sala.host && sala.guest;
+        if (salaCompleta && sala.timeoutLimpieza) {
+          clearTimeout(sala.timeoutLimpieza);
+          sala.timeoutLimpieza = null;
+        }
+
+        enviar(ws, { type: 'reconectado', codigo, rol });
+        const rival = obtenerRival(ws);
+        enviar(rival, { type: 'rival_reconectado' });
+        break;
+      }
+
       case 'mensaje': {
         const rival = obtenerRival(ws);
         if (rival) {
@@ -208,7 +275,7 @@ wss.on('connection', (ws) => {
     if (idx !== -1) colaMatchmaking.splice(idx, 1);
 
     if (ws.codigoSala) {
-      limpiarSala(ws);
+      manejarDesconexion(ws);
     }
   });
 });
@@ -217,4 +284,5 @@ servidorHttp.listen(PUERTO, '0.0.0.0', () => {
   console.log(`[Relay] Escuchando en el puerto ${PUERTO}.`);
   console.log('[Relay] LAN: los dispositivos se conectan a ws://<IP-de-esta-PC>:' + PUERTO);
   console.log('[Relay] Internet: los dispositivos se conectan a wss://<tu-dominio>, sin puerto.');
+  console.log(`[Relay] Ventana de gracia para reconexión: ${GRACIA_RECONEXION_MS / 1000}s.`);
 });
