@@ -1,22 +1,172 @@
 // Relay PvP compatible con LAN y hosting Node (Render/Railway/VPS).
 // Mantiene salas privadas por código y separa las colas de matchmaking
-// de PvP normal y Clasificatoria. No ejecuta ni valida lógica de batalla.
+// de PvP normal y Clasificatoria. La API HTTP añade identidad online y
+// lectura del ranking; la lógica y validación de batalla siguen en la app.
+'use strict';
+
 const http = require('http');
 const WebSocket = require('ws');
+const { GitHubDataStore } = require('./github-data-store');
+const { AuthApi } = require('./auth-api');
 
 const PUERTO = process.env.PORT || process.env.PUERTO || 8765;
 const GRACIA_RECONEXION_MS = 45000;
-const servidorHttp = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('Relay de PvP activo. Conectate por WebSocket (wss://), no por HTTP.');
+const MAX_BODY_BYTES = 16 * 1024;
+const VENTANA_RATE_LIMIT_MS = 15 * 60 * 1000;
+const MAX_AUTH_INTENTOS = 15;
+
+let dataStore = null;
+let authApi = null;
+try {
+  dataStore = new GitHubDataStore(process.env);
+  if (process.env.AUTH_TOKEN_SECRET) authApi = new AuthApi(dataStore, process.env.AUTH_TOKEN_SECRET);
+} catch (error) {
+  console.warn('[API] Persistencia online no configurada:', error.message);
+}
+
+const intentosAuth = new Map();
+const servidorHttp = http.createServer(async (req, res) => {
+  const origin = req.headers.origin || '';
+  const allowedOrigins = (process.env.APP_ORIGINS || '*').split(',').map(v => v.trim()).filter(Boolean);
+  if (allowedOrigins.indexOf('*') !== -1 || allowedOrigins.indexOf(origin) !== -1) {
+    res.setHeader('Access-Control-Allow-Origin', allowedOrigins.indexOf('*') !== -1 ? '*' : origin);
+  }
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  res.setHeader('Cache-Control', 'no-store');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  const url = new URL(req.url, 'http://localhost');
+  if (url.pathname.indexOf('/api/') !== 0) {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Relay de PvP activo. Conectate por WebSocket (wss://), no por HTTP.');
+    return;
+  }
+
+  const sendJson = (status, payload) => {
+    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify(payload));
+  };
+  const requireApi = () => {
+    if (!authApi || !dataStore) {
+      sendJson(503, { ok: false, mensaje: 'La API online todavía no está configurada en Render.' });
+      return false;
+    }
+    return true;
+  };
+  const readBody = () => new Promise((resolve, reject) => {
+    let raw = '';
+    let bytes = 0;
+    req.on('data', chunk => {
+      bytes += chunk.length;
+      if (bytes > MAX_BODY_BYTES) {
+        reject(Object.assign(new Error('Solicitud demasiado grande.'), { status: 413 }));
+        req.destroy();
+        return;
+      }
+      raw += chunk.toString('utf8');
+    });
+    req.on('end', () => {
+      try { resolve(raw ? JSON.parse(raw) : {}); }
+      catch (_) { reject(Object.assign(new Error('JSON inválido.'), { status: 400 })); }
+    });
+    req.on('error', reject);
+  });
+  const getBearer = () => {
+    const header = String(req.headers.authorization || '');
+    return /^Bearer\s+/i.test(header) ? header.replace(/^Bearer\s+/i, '').trim() : '';
+  };
+  const checkRateLimit = () => {
+    const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    const ip = forwarded || req.socket.remoteAddress || 'unknown';
+    const now = Date.now();
+    let entry = intentosAuth.get(ip);
+    if (!entry || now - entry.start > VENTANA_RATE_LIMIT_MS) {
+      entry = { start: now, count: 0 };
+      intentosAuth.set(ip, entry);
+    }
+    entry.count += 1;
+    return entry.count <= MAX_AUTH_INTENTOS;
+  };
+
+  try {
+    if (url.pathname === '/api/health' && req.method === 'GET') {
+      sendJson(200, { ok: true, relay: true, auth: !!authApi, storage: !!dataStore });
+      return;
+    }
+    if (url.pathname === '/api/admin/migration-code' && req.method === 'POST') {
+      if (!authApi || !dataStore) { sendJson(503, { ok: false, mensaje: 'La API online todavía no está configurada en Render.' }); return; }
+      const adminKey = String(req.headers['x-migration-admin-key'] || '');
+      const configuredKey = String(process.env.MIGRATION_ADMIN_KEY || '');
+      const supplied = Buffer.from(adminKey);
+      const expected = Buffer.from(configuredKey);
+      if (!configuredKey || supplied.length !== expected.length || !require('crypto').timingSafeEqual(supplied, expected)) {
+        sendJson(403, { ok: false, mensaje: 'No autorizado.' }); return;
+      }
+      const body = await readBody();
+      const code = await authApi.createMigrationCode(body.usuario);
+      sendJson(201, { ok: true, usuario: String(body.usuario).trim(), migrationCode: code, expiresInDays: 7 });
+      return;
+    }
+    if (url.pathname === '/api/auth/register' && req.method === 'POST') {
+      if (!requireApi()) return;
+      if (!checkRateLimit()) { sendJson(429, { ok: false, mensaje: 'Demasiados intentos. Inténtalo más tarde.' }); return; }
+      const body = await readBody();
+      const user = await authApi.createUser(body);
+      sendJson(201, {
+        ok: true,
+        token: authApi.issueToken(user),
+        usuario: user.usuario,
+        nombrePersonaje: user.nombrePersonaje
+      });
+      return;
+    }
+    if ((url.pathname === '/api/auth/login' || url.pathname === '/api/auth/link') && req.method === 'POST') {
+      if (!requireApi()) return;
+      if (!checkRateLimit()) { sendJson(429, { ok: false, mensaje: 'Demasiados intentos. Inténtalo más tarde.' }); return; }
+      const body = await readBody();
+      // Las cuentas locales antiguas requieren un código de migración de un solo uso,
+      // emitido por el administrador. El servidor no confía en una validación hecha
+      // únicamente por el cliente porque las cuentas antiguas solo existían localmente.
+      const result = url.pathname === '/api/auth/link'
+        ? await authApi.linkLegacyAccount(body)
+        : await authApi.authenticate(body, false);
+      sendJson(200, Object.assign({ ok: true }, result));
+      return;
+    }
+    if (url.pathname === '/api/me' && req.method === 'GET') {
+      if (!requireApi()) return;
+      const user = await authApi.getAuthenticatedUser(getBearer());
+      if (!user) { sendJson(401, { ok: false, mensaje: 'Sesión online inválida o vencida.' }); return; }
+      sendJson(200, { ok: true, usuario: user.usuario, nombrePersonaje: user.nombrePersonaje });
+      return;
+    }
+    if (url.pathname === '/api/ranking' && req.method === 'GET') {
+      if (!requireApi()) return;
+      const user = await authApi.getAuthenticatedUser(getBearer());
+      if (!user) { sendJson(401, { ok: false, mensaje: 'Debes iniciar sesión para consultar el ranking.' }); return; }
+      const ranking = await authApi.getRanking();
+      sendJson(200, { ok: true, ranking });
+      return;
+    }
+    sendJson(404, { ok: false, mensaje: 'Ruta API no encontrada.' });
+  } catch (error) {
+    const status = Number(error.status) || 500;
+    if (status >= 500) console.error('[API]', error);
+    sendJson(status, { ok: false, mensaje: status >= 500 ? 'Error interno al procesar la solicitud.' : error.message });
+  }
 });
+
 const wss = new WebSocket.Server({ server: servidorHttp });
 const salas = new Map();
-// Cada modalidad tiene su propia cola FIFO. Así no se cruzan los modos.
-const colasMatchmaking = {
-  normal: [],
-  clasificatoria: []
-};
+const conexionesPorUsuario = new Map();
+const colasMatchmaking = { normal: [], clasificatoria: [] };
 const ALFABETO_CODIGO = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
 function generarCodigoUnico() {
@@ -68,13 +218,32 @@ wss.on('connection', ws => {
   ws.rol = null;
   ws.enColaMatchmaking = false;
   ws.modoMatchmaking = null;
+  ws.usuarioOnline = null;
 
   ws.on('message', raw => {
     let msg;
     try { msg = JSON.parse(raw); }
-    catch (err) { enviar(ws, { type: 'error', mensaje: 'Mensaje mal formado (no es JSON válido).' }); return; }
-
+    catch (_) { enviar(ws, { type: 'error', mensaje: 'Mensaje mal formado (no es JSON válido).' }); return; }
     switch (msg.type) {
+      case 'autenticar': {
+        if (!authApi) { enviar(ws, { type: 'error', mensaje: 'La autenticación online no está configurada.' }); return; }
+        if (ws.codigoSala || ws.enColaMatchmaking) { enviar(ws, { type: 'error', mensaje: 'No puedes cambiar de cuenta durante una partida o búsqueda.' }); return; }
+        authApi.getAuthenticatedUser(String(msg.token || '')).then(user => {
+          if (!user) { enviar(ws, { type: 'error', mensaje: 'La sesión online no es válida. Inicia sesión nuevamente.' }); return; }
+          const anterior = conexionesPorUsuario.get(user.id);
+          if (anterior && anterior !== ws && anterior.readyState === WebSocket.OPEN) {
+            enviar(ws, { type: 'error', mensaje: 'Esta cuenta ya tiene una conexión online activa.' });
+            return;
+          }
+          ws.usuarioOnline = { id: user.id, usuario: user.usuario, nombrePersonaje: user.nombrePersonaje };
+          conexionesPorUsuario.set(user.id, ws);
+          enviar(ws, { type: 'sesion_online', usuario: user.usuario, nombrePersonaje: user.nombrePersonaje });
+        }).catch(error => {
+          console.error('[WS auth]', error);
+          enviar(ws, { type: 'error', mensaje: 'No se pudo verificar la sesión online.' });
+        });
+        break;
+      }
       case 'crear_sala': {
         if (ws.codigoSala) { enviar(ws, { type: 'error', mensaje: 'Ya estás dentro de una sala.' }); return; }
         const codigo = generarCodigoUnico();
@@ -84,7 +253,6 @@ wss.on('connection', ws => {
         enviar(ws, { type: 'sala_creada', codigo });
         break;
       }
-
       case 'unirse_sala': {
         const codigo = (msg.codigo || '').toUpperCase().trim();
         const sala = salas.get(codigo);
@@ -99,11 +267,13 @@ wss.on('connection', ws => {
         enviar(sala.guest, { type: 'rival_conectado', codigo, rol: 'guest' });
         break;
       }
-
       case 'buscar_rival': {
         if (ws.enColaMatchmaking || ws.codigoSala) break;
-        // Clientes antiguos que no envían `modo` siguen entrando a PvP normal.
         const modo = msg.modo === 'clasificatoria' ? 'clasificatoria' : 'normal';
+        if (modo === 'clasificatoria' && !ws.usuarioOnline) {
+          enviar(ws, { type: 'error', mensaje: 'Debes iniciar sesión online para jugar Clasificatoria.' });
+          return;
+        }
         const cola = colasMatchmaking[modo];
         let rival = null;
         while (cola.length > 0) {
@@ -132,12 +302,9 @@ wss.on('connection', ws => {
         }
         break;
       }
-
-      case 'cancelar_busqueda': {
+      case 'cancelar_busqueda':
         quitarDeColas(ws);
         break;
-      }
-
       case 'reconectar': {
         const codigo = (msg.codigo || '').toUpperCase().trim();
         const sala = salas.get(codigo);
@@ -156,19 +323,20 @@ wss.on('connection', ws => {
         enviar(obtenerRival(ws), { type: 'rival_reconectado' });
         break;
       }
-
       case 'mensaje': {
         const rival = obtenerRival(ws);
         if (rival) enviar(rival, { type: 'mensaje', payload: msg.payload });
         break;
       }
-
       default:
         enviar(ws, { type: 'error', mensaje: `Tipo de mensaje desconocido: ${msg.type}` });
     }
   });
 
   ws.on('close', () => {
+    if (ws.usuarioOnline && conexionesPorUsuario.get(ws.usuarioOnline.id) === ws) {
+      conexionesPorUsuario.delete(ws.usuarioOnline.id);
+    }
     quitarDeColas(ws);
     if (ws.codigoSala) manejarDesconexion(ws);
   });
@@ -179,4 +347,5 @@ servidorHttp.listen(PUERTO, '0.0.0.0', () => {
   console.log('[Relay] LAN: ws://<IP-de-esta-PC>:' + PUERTO);
   console.log('[Relay] Internet: wss://<tu-dominio>, sin puerto.');
   console.log(`[Relay] Ventana de gracia para reconexión: ${GRACIA_RECONEXION_MS / 1000}s.`);
+  console.log(`[API] Autenticación online: ${authApi ? 'configurada' : 'pendiente de variables de entorno'}.`);
 });
