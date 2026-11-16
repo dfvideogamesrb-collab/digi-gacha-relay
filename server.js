@@ -34,7 +34,7 @@ const servidorHttp = http.createServer(async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', allowedOrigins.indexOf('*') !== -1 ? '*' : origin);
   }
   res.setHeader('Vary', 'Origin');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
   res.setHeader('Cache-Control', 'no-store');
 
