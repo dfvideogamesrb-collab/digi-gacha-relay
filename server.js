@@ -11,7 +11,7 @@ const { AuthApi } = require('./auth-api');
 
 const PUERTO = process.env.PORT || process.env.PUERTO || 8765;
 const GRACIA_RECONEXION_MS = 45000;
-const MAX_BODY_BYTES = 16 * 1024;
+const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const VENTANA_RATE_LIMIT_MS = 15 * 60 * 1000;
 const MAX_AUTH_INTENTOS = 15;
 
@@ -174,6 +174,38 @@ const servidorHttp = http.createServer(async (req, res) => {
       const resultado = await authApi.registrarResultadoIA(matchId, user.id, body.ganaste);
       ticket.used = true;
       sendJson(200, { ok: true, puntosDelta: resultado.puntosDelta, puntosActuales: resultado.puntosActuales });
+      return;
+    }
+
+    if (url.pathname === '/api/player-data' && req.method === 'GET') {
+      if (!requireApi()) return;
+      const user = await authApi.getAuthenticatedUser(getBearer());
+      if (!user) { sendJson(401, { ok: false, mensaje: 'Debes iniciar sesión para descargar tus datos.' }); return; }
+      const saved = await dataStore.read(`player_${user.id}.json`);
+      sendJson(200, { ok: true, exists: !!saved.sha, data: saved.data && saved.data.snapshot ? saved.data.snapshot : {}, updatedAt: saved.data && saved.data.updatedAt || null });
+      return;
+    }
+    if (url.pathname === '/api/player-data' && req.method === 'PUT') {
+      if (!requireApi()) return;
+      const user = await authApi.getAuthenticatedUser(getBearer());
+      if (!user) { sendJson(401, { ok: false, mensaje: 'Debes iniciar sesión para guardar tus datos.' }); return; }
+      const body = await readBody();
+      const snapshot = body && body.snapshot;
+      if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) { sendJson(400, { ok: false, mensaje: 'El respaldo de jugador no es válido.' }); return; }
+      const serialized = JSON.stringify(snapshot);
+      if (Buffer.byteLength(serialized, 'utf8') > 2 * 1024 * 1024) { sendJson(413, { ok: false, mensaje: 'El respaldo supera el límite permitido de 2 MB.' }); return; }
+      const allowedPrefix = `${user.usuario}_`;
+      for (const key of Object.keys(snapshot)) {
+        if (!key.startsWith(allowedPrefix) || typeof snapshot[key] !== 'string') { sendJson(400, { ok: false, mensaje: 'El respaldo contiene claves que no pertenecen a esta cuenta.' }); return; }
+      }
+      const saved = await dataStore.transaction(async () => {
+        const file = `player_${user.id}.json`;
+        const current = await dataStore.read(file);
+        const next = { version: Number(current.data && current.data.version || 0) + 1, updatedAt: new Date().toISOString(), snapshot };
+        await dataStore.write(file, next, current.sha);
+        return next;
+      });
+      sendJson(200, { ok: true, version: saved.version, updatedAt: saved.updatedAt });
       return;
     }
 

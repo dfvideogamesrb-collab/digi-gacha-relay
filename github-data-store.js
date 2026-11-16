@@ -21,7 +21,8 @@ class GitHubDataStore {
   }
 
   pathFor(file) {
-    if (!Object.prototype.hasOwnProperty.call(DEFAULT_FILES, file)) {
+    const isPlayerFile = /^player_[a-f0-9-]{36}\.json$/i.test(String(file || ''));
+    if (!Object.prototype.hasOwnProperty.call(DEFAULT_FILES, file) && !isPlayerFile) {
       throw new Error('Archivo de datos no permitido.');
     }
     return this.directory ? `${this.directory}/${file}` : file;
@@ -38,7 +39,7 @@ class GitHubDataStore {
         'User-Agent': 'digi-gacha-relay'
       }
     });
-    if (response.status === 404) return { data: JSON.parse(JSON.stringify(DEFAULT_FILES[file])), sha: null };
+    if (response.status === 404) return { data: Object.prototype.hasOwnProperty.call(DEFAULT_FILES, file) ? JSON.parse(JSON.stringify(DEFAULT_FILES[file])) : { version: 1, updatedAt: null, snapshot: {} }, sha: null };
     if (!response.ok) throw new Error(`GitHub read failed (${response.status}).`);
     const fileData = await response.json();
     const decoded = Buffer.from(String(fileData.content || '').replace(/\n/g, ''), 'base64').toString('utf8');
