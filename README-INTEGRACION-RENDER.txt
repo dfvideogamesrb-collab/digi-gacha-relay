@@ -13,7 +13,7 @@ INTEGRACION DE CUENTAS ONLINE Y RANKING — DIGI-GACHA RELAY
    []
 
    data/historial_clasificatoria.txt
-   []
+   (déjalo vacío)
 
    data/migration_codes.txt
    []
@@ -89,3 +89,20 @@ SEGURIDAD / ALCANCE DE ESTA ENTREGA
 - Las cuentas nuevas se registran directamente con /api/auth/register.
 - Esta entrega prepara la API; los componentes Ionic de registro/ingreso aún
   deben conectarse a ella y guardar el token de sesión.
+
+MIGRACION AUTOMATICA DE CUENTAS LOCALES (ACTUALIZACION)
+
+La app actualizada intenta primero /api/auth/login. Si el servidor responde
+que el usuario todavía no existe y el dispositivo conserva una cuenta local
+con la misma contraseña, la app llama a POST /api/auth/migrate-local. El relay
+crea el usuario en users.txt guardando únicamente salt + hash scrypt y crea
+su entrada inicial en ranking.txt. En los siguientes dispositivos el jugador
+usa el login online normal. Tras validar la cuenta, la app conserva el perfil
+local necesario para el juego y limpia la contraseña del registro local.
+
+IMPORTANTE: como las cuentas antiguas nunca estuvieron registradas en el
+servidor, el servidor no puede comprobar por sí solo quién era su propietario.
+La migración automática usa la contraseña guardada en el dispositivo original
+y el primer registro online del nombre de usuario. Para cuentas con valor
+elevado o si se necesita una prueba de propiedad más fuerte, conserva el flujo
+protegido con código de migración de un solo uso (/api/auth/link).

@@ -11,7 +11,7 @@ const { AuthApi } = require('./auth-api');
 
 const PUERTO = process.env.PORT || process.env.PUERTO || 8765;
 const GRACIA_RECONEXION_MS = 45000;
-const MAX_BODY_BYTES = 2 * 1024 * 1024;
+const MAX_BODY_BYTES = 16 * 1024;
 const VENTANA_RATE_LIMIT_MS = 15 * 60 * 1000;
 const MAX_AUTH_INTENTOS = 15;
 
@@ -25,8 +25,6 @@ try {
 }
 
 const intentosAuth = new Map();
-const ticketsPartidaIA = new Map();
-const GRACIA_TICKET_IA_MS = 2 * 60 * 60 * 1000;
 const servidorHttp = http.createServer(async (req, res) => {
   const origin = req.headers.origin || '';
   const allowedOrigins = (process.env.APP_ORIGINS || '*').split(',').map(v => v.trim()).filter(Boolean);
@@ -34,7 +32,7 @@ const servidorHttp = http.createServer(async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', allowedOrigins.indexOf('*') !== -1 ? '*' : origin);
   }
   res.setHeader('Vary', 'Origin');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
   res.setHeader('Cache-Control', 'no-store');
 
@@ -129,6 +127,14 @@ const servidorHttp = http.createServer(async (req, res) => {
       });
       return;
     }
+    if (url.pathname === '/api/auth/migrate-local' && req.method === 'POST') {
+      if (!requireApi()) return;
+      if (!checkRateLimit()) { sendJson(429, { ok: false, mensaje: 'Demasiados intentos. Inténtalo más tarde.' }); return; }
+      const body = await readBody();
+      const result = await authApi.migrateLocalAccount(body);
+      sendJson(200, Object.assign({ ok: true, migrated: true }, result));
+      return;
+    }
     if ((url.pathname === '/api/auth/login' || url.pathname === '/api/auth/link') && req.method === 'POST') {
       if (!requireApi()) return;
       if (!checkRateLimit()) { sendJson(429, { ok: false, mensaje: 'Demasiados intentos. Inténtalo más tarde.' }); return; }
@@ -149,66 +155,6 @@ const servidorHttp = http.createServer(async (req, res) => {
       sendJson(200, { ok: true, usuario: user.usuario, nombrePersonaje: user.nombrePersonaje });
       return;
     }
-    if (url.pathname === '/api/ranking/ai-match/cancel' && req.method === 'POST') {
-      if (!requireApi()) return;
-      const user = await authApi.getAuthenticatedUser(getBearer());
-      if (!user) { sendJson(401, { ok: false, mensaje: 'Debes iniciar sesión para cancelar esta autorización.' }); return; }
-      const body = await readBody();
-      const ticket = ticketsPartidaIA.get(String(body.matchId || ''));
-      if (ticket && ticket.userId === user.id && !ticket.used) ticketsPartidaIA.delete(String(body.matchId));
-      sendJson(200, { ok: true });
-      return;
-    }
-
-    if (url.pathname === '/api/ranking/ai-match/result' && req.method === 'POST') {
-      if (!requireApi()) return;
-      const user = await authApi.getAuthenticatedUser(getBearer());
-      if (!user) { sendJson(401, { ok: false, mensaje: 'Debes iniciar sesión para registrar el resultado.' }); return; }
-      const body = await readBody();
-      const matchId = String(body.matchId || '');
-      if (typeof body.ganaste !== 'boolean') { sendJson(400, { ok: false, mensaje: 'El resultado de la partida es inválido.' }); return; }
-      const ticket = ticketsPartidaIA.get(matchId);
-      if (!ticket || ticket.userId !== user.id || ticket.expiresAt < Date.now()) {
-        sendJson(401, { ok: false, mensaje: 'La autorización de esta partida IA no existe, venció o ya fue utilizada.' }); return;
-      }
-      const resultado = await authApi.registrarResultadoIA(matchId, user.id, body.ganaste);
-      ticket.used = true;
-      sendJson(200, { ok: true, puntosDelta: resultado.puntosDelta, puntosActuales: resultado.puntosActuales });
-      return;
-    }
-
-    if (url.pathname === '/api/player-data' && req.method === 'GET') {
-      if (!requireApi()) return;
-      const user = await authApi.getAuthenticatedUser(getBearer());
-      if (!user) { sendJson(401, { ok: false, mensaje: 'Debes iniciar sesión para descargar tus datos.' }); return; }
-      const saved = await dataStore.read(`player_${user.id}.json`);
-      sendJson(200, { ok: true, exists: !!saved.sha, data: saved.data && saved.data.snapshot ? saved.data.snapshot : {}, updatedAt: saved.data && saved.data.updatedAt || null });
-      return;
-    }
-    if (url.pathname === '/api/player-data' && req.method === 'PUT') {
-      if (!requireApi()) return;
-      const user = await authApi.getAuthenticatedUser(getBearer());
-      if (!user) { sendJson(401, { ok: false, mensaje: 'Debes iniciar sesión para guardar tus datos.' }); return; }
-      const body = await readBody();
-      const snapshot = body && body.snapshot;
-      if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) { sendJson(400, { ok: false, mensaje: 'El respaldo de jugador no es válido.' }); return; }
-      const serialized = JSON.stringify(snapshot);
-      if (Buffer.byteLength(serialized, 'utf8') > 2 * 1024 * 1024) { sendJson(413, { ok: false, mensaje: 'El respaldo supera el límite permitido de 2 MB.' }); return; }
-      const allowedPrefix = `${user.usuario}_`;
-      for (const key of Object.keys(snapshot)) {
-        if (!key.startsWith(allowedPrefix) || typeof snapshot[key] !== 'string') { sendJson(400, { ok: false, mensaje: 'El respaldo contiene claves que no pertenecen a esta cuenta.' }); return; }
-      }
-      const saved = await dataStore.transaction(async () => {
-        const file = `player_${user.id}.json`;
-        const current = await dataStore.read(file);
-        const next = { version: Number(current.data && current.data.version || 0) + 1, updatedAt: new Date().toISOString(), snapshot };
-        await dataStore.write(file, next, current.sha);
-        return next;
-      });
-      sendJson(200, { ok: true, version: saved.version, updatedAt: saved.updatedAt });
-      return;
-    }
-
     if (url.pathname === '/api/ranking' && req.method === 'GET') {
       if (!requireApi()) return;
       const user = await authApi.getAuthenticatedUser(getBearer());
@@ -250,7 +196,6 @@ function obtenerRival(ws) {
   return null;
 }
 function quitarDeColas(ws) {
-  if (ws.timeoutIA) { clearTimeout(ws.timeoutIA); ws.timeoutIA = null; }
   Object.keys(colasMatchmaking).forEach(modo => {
     const cola = colasMatchmaking[modo];
     const idx = cola.indexOf(ws);
@@ -259,56 +204,9 @@ function quitarDeColas(ws) {
   ws.enColaMatchmaking = false;
   ws.modoMatchmaking = null;
 }
-async function cerrarSalaConResultado(sala, ganadorRol, tipo) {
-  if (!sala || sala.resultadoRegistrado || sala.resultadoEnProceso) return;
-  sala.resultadoEnProceso = true;
-  const esClasificatoria = sala.modoMatchmaking === 'clasificatoria';
-  const ganador = ganadorRol === 'host' ? sala.hostUser : sala.guestUser;
-  const perdedor = ganadorRol === 'host' ? sala.guestUser : sala.hostUser;
-  if (esClasificatoria && (!ganador || !perdedor)) {
-    sala.resultadoEnProceso = false;
-    throw new Error('La partida clasificatoria no tiene ambas identidades online verificadas.');
-  }
-
-  let resultadoPersistido = null;
-  if (esClasificatoria) {
-    if (!authApi) { sala.resultadoEnProceso = false; throw new Error('La persistencia del ranking no está configurada.'); }
-    try {
-      resultadoPersistido = await authApi.registrarResultadoClasificatoria(
-        sala.matchId, ganador.id, perdedor.id, tipo
-      );
-    } catch (error) { sala.resultadoEnProceso = false; throw error; }
-  }
-
-  sala.resultadoRegistrado = true;
-  sala.resultadoEnProceso = false;
-  const payloadResultado = {
-    type: 'resultado_partida',
-    clasificatoria: esClasificatoria,
-    resultado: tipo,
-    ganaste: true,
-    puntosGanados: esClasificatoria ? 20 : 0,
-    puntosActuales: esClasificatoria && resultadoPersistido ? resultadoPersistido.resultado.puntosActualesGanador : null
-  };
-  const payloadDerrota = {
-    type: 'resultado_partida',
-    clasificatoria: esClasificatoria,
-    resultado: tipo,
-    ganaste: false,
-    puntosPerdidos: esClasificatoria ? -10 : 0,
-    puntosActuales: esClasificatoria && resultadoPersistido ? resultadoPersistido.resultado.puntosActualesPerdedor : null
-  };
-  const ganadorWs = ganadorRol === 'host' ? sala.host : sala.guest;
-  const perdedorWs = ganadorRol === 'host' ? sala.guest : sala.host;
-  enviar(ganadorWs, payloadResultado);
-  enviar(perdedorWs, payloadDerrota);
-  if (sala.timeoutLimpieza) clearTimeout(sala.timeoutLimpieza);
-  salas.delete(sala.codigo);
-}
-
 function manejarDesconexion(ws) {
   const sala = salas.get(ws.codigoSala);
-  if (!sala || (sala.host !== ws && sala.guest !== ws)) return;
+  if (!sala) return;
   const rival = obtenerRival(ws);
   enviar(rival, { type: 'rival_desconectado' });
   if (sala.host === ws) sala.host = null;
@@ -318,17 +216,8 @@ function manejarDesconexion(ws) {
     const salaActual = salas.get(ws.codigoSala);
     if (!salaActual) return;
     const restante = salaActual.host || salaActual.guest;
-    const rolPerdedor = ws.rol === 'host' ? 'host' : 'guest';
-    const rolGanador = rolPerdedor === 'host' ? 'guest' : 'host';
-    if (salaActual.modoMatchmaking === 'clasificatoria' && !salaActual.resultadoRegistrado) {
-      cerrarSalaConResultado(salaActual, rolGanador, 'desconexion').catch(error => {
-        console.error('[Ranking] No se pudo registrar la desconexión:', error);
-        enviar(restante, { type: 'error', mensaje: 'No se pudo guardar el resultado de clasificatoria. No cierres esta pantalla e inténtalo de nuevo.' });
-      });
-    } else {
-      if (restante) enviar(restante, { type: 'rival_desconectado_definitivo' });
-      salas.delete(ws.codigoSala);
-    }
+    if (restante) enviar(restante, { type: 'rival_desconectado_definitivo' });
+    salas.delete(ws.codigoSala);
   }, GRACIA_RECONEXION_MS);
 }
 
@@ -338,8 +227,6 @@ wss.on('connection', ws => {
   ws.enColaMatchmaking = false;
   ws.modoMatchmaking = null;
   ws.usuarioOnline = null;
-  ws.timeoutIA = null;
-  ws.inicioCola = 0;
 
   ws.on('message', raw => {
     let msg;
@@ -368,7 +255,7 @@ wss.on('connection', ws => {
       case 'crear_sala': {
         if (ws.codigoSala) { enviar(ws, { type: 'error', mensaje: 'Ya estás dentro de una sala.' }); return; }
         const codigo = generarCodigoUnico();
-        salas.set(codigo, { codigo, host: ws, guest: null, hostUser: ws.usuarioOnline, guestUser: null, timeoutLimpieza: null, modoMatchmaking: null, matchId: require('crypto').randomUUID(), resultadoRegistrado: false, resultadoEnProceso: false });
+        salas.set(codigo, { host: ws, guest: null, timeoutLimpieza: null, modoMatchmaking: null });
         ws.codigoSala = codigo;
         ws.rol = 'host';
         enviar(ws, { type: 'sala_creada', codigo });
@@ -381,7 +268,6 @@ wss.on('connection', ws => {
         if (sala.guest) { enviar(ws, { type: 'error', mensaje: 'Esa sala ya tiene dos jugadores.' }); return; }
         if (ws.codigoSala) { enviar(ws, { type: 'error', mensaje: 'Ya estás dentro de una sala.' }); return; }
         sala.guest = ws;
-        sala.guestUser = ws.usuarioOnline;
         ws.codigoSala = codigo;
         ws.rol = 'guest';
         enviar(ws, { type: 'unido', codigo });
@@ -406,11 +292,10 @@ wss.on('connection', ws => {
           }
         }
         if (rival) {
-          if (rival.timeoutIA) { clearTimeout(rival.timeoutIA); rival.timeoutIA = null; }
           rival.enColaMatchmaking = false;
           rival.modoMatchmaking = null;
           const codigo = generarCodigoUnico();
-          salas.set(codigo, { codigo, host: rival, guest: ws, hostUser: rival.usuarioOnline, guestUser: ws.usuarioOnline, timeoutLimpieza: null, modoMatchmaking: modo, matchId: require('crypto').randomUUID(), resultadoRegistrado: false, resultadoEnProceso: false });
+          salas.set(codigo, { host: rival, guest: ws, timeoutLimpieza: null, modoMatchmaking: modo });
           rival.codigoSala = codigo;
           rival.rol = 'host';
           ws.codigoSala = codigo;
@@ -420,20 +305,8 @@ wss.on('connection', ws => {
         } else {
           ws.enColaMatchmaking = true;
           ws.modoMatchmaking = modo;
-          ws.inicioCola = Date.now();
           cola.push(ws);
           enviar(ws, { type: 'buscando_rival', modo });
-          if (modo === 'clasificatoria') {
-            ws.timeoutIA = setTimeout(() => {
-              if (!ws.enColaMatchmaking || ws.modoMatchmaking !== 'clasificatoria' || ws.readyState !== WebSocket.OPEN) return;
-              quitarDeColas(ws);
-              const yaTieneTicket = Array.from(ticketsPartidaIA.values()).some(t => t.userId === (ws.usuarioOnline && ws.usuarioOnline.id) && !t.used && t.expiresAt > Date.now());
-              if (yaTieneTicket) { enviar(ws, { type: 'error', mensaje: 'Ya tienes una partida clasificatoria contra IA pendiente de resultado.' }); return; }
-              const matchId = require('crypto').randomUUID();
-              ticketsPartidaIA.set(matchId, { userId: ws.usuarioOnline.id, expiresAt: Date.now() + GRACIA_TICKET_IA_MS, used: false });
-              enviar(ws, { type: 'ai_match_ticket', matchId, modo: 'clasificatoria' });
-            }, 30000);
-          }
         }
         break;
       }
@@ -458,35 +331,9 @@ wss.on('connection', ws => {
         enviar(obtenerRival(ws), { type: 'rival_reconectado' });
         break;
       }
-      case 'rendirse': {
-        const sala = salas.get(ws.codigoSala);
-        if (!sala || !sala.host || !sala.guest) { enviar(ws, { type: 'error', mensaje: 'No hay una partida activa para rendirse.' }); return; }
-        const ganadorRol = ws.rol === 'host' ? 'guest' : 'host';
-        cerrarSalaConResultado(sala, ganadorRol, 'rendicion').catch(error => {
-          console.error('[Ranking] No se pudo registrar la rendición:', error);
-          enviar(ws, { type: 'error', mensaje: 'No se pudo registrar el resultado. Inténtalo nuevamente.' });
-        });
-        break;
-      }
       case 'mensaje': {
-        const sala = salas.get(ws.codigoSala);
         const rival = obtenerRival(ws);
-        const payload = msg.payload;
-        // El HOST es la autoridad actual del motor de batalla. Cuando anuncia
-        // un estado terminal, el relay registra el resultado clasificatorio.
-        if (sala && sala.modoMatchmaking === 'clasificatoria' && ws.rol === 'host' &&
-            payload && payload.tipo === 'estado_actualizado' && payload.estado && payload.estado.terminada &&
-            !sala.resultadoRegistrado) {
-          const ganadorRol = payload.estado.ganador === 'JUGADOR' ? 'host' :
-            payload.estado.ganador === 'MAQUINA' ? 'guest' : null;
-          if (ganadorRol) {
-            cerrarSalaConResultado(sala, ganadorRol, 'normal').catch(error => {
-              console.error('[Ranking] No se pudo registrar el resultado:', error);
-              enviar(ws, { type: 'error', mensaje: 'No se pudo guardar el resultado de clasificatoria.' });
-            });
-          }
-        }
-        if (rival) enviar(rival, { type: 'mensaje', payload });
+        if (rival) enviar(rival, { type: 'mensaje', payload: msg.payload });
         break;
       }
       default:
