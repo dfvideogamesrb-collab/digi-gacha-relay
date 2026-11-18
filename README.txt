@@ -1,18 +1,15 @@
-CORRECCIÓN DE SINCRONIZACIÓN COMPLETA DEL PROGRESO
+CORRECCION: MIGRACION AUTOMATICA DE CUENTAS LOCALES
 
-Este parche complementa los parches anteriores de autenticación.
-No reemplaza package.json ni archivos Android.
+Archivos incluidos (solo modificados):
+- server.js
+- auth-api.js
 
-1) En digi-gacha-relay, reemplazar server.js por relay/server.js y desplegar Render.
-   Añade GET/PUT /api/player-data, CORS para PUT y límite de 2 MB.
-2) En digi-gacha, copiar los archivos dentro de ionic/ respetando las rutas.
-   PlayerCloudSyncService se incorpora al inicio de sesión antes de abrir el lobby.
-3) El primer inicio de sesión en el dispositivo que conserva el progreso local
-   sube todas las claves usuario_* a data/player_<UUID>.json. En otro dispositivo
-   descarga ese respaldo y restaura las claves. Si el respaldo remoto está parcial,
-   combina las claves faltantes locales y remotas en vez de borrar datos.
+Esta correccion se basa en el relay completo con matchmaking PvP/Clasificatoria,
+ranking y endpoints /api/player-data. Conserva esa implementacion y agrega:
+- POST /api/auth/migrate-local
+- AuthApi.migrateLocalAccount()
+- CORS PUT para el guardado de progreso en /api/player-data
 
-El respaldo incluye todos los datos persistidos en localStorage cuyas claves
-comienzan con el usuario_: mochila, equipos, Bits, items, Plugins, torre, dungeon,
-historia, tutorial, recompensas y cualquier otro dato por cuenta con ese prefijo.
-No incluye preferencias globales de audio ni usuarios_terminal.txt.
+Reemplaza estos dos archivos en el repositorio digi-gacha-relay y despliega Render.
+No reemplaces el server.js por el ZIP reducido de migracion de cuentas: este ZIP
+conserva la version completa del relay y sus rutas de clasificatoria.

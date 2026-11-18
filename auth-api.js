@@ -200,13 +200,6 @@ class AuthApi {
     return { token: this.issueToken(user), usuario: user.usuario, nombrePersonaje: user.nombrePersonaje };
   }
 
-
-  /**
-   * Migra una cuenta heredada que solo existía en el almacenamiento local
-   * del dispositivo original. El cliente solo llama a este método después
-   * de comprobar usuario y contraseña contra su copia local.
-   * Si la cuenta ya existe online, exige que la contraseña coincida.
-   */
   async migrateLocalAccount(input) {
     const usuario = String(input.usuario || '').trim();
     const nombrePersonaje = String(input.nombrePersonaje || usuario).trim();
@@ -315,9 +308,116 @@ class AuthApi {
     return users.find(u => u.id === payload.sub) || null;
   }
 
+
+  async registrarResultadoClasificatoria(matchId, ganadorId, perdedorId, tipo) {
+    if (!matchId || !ganadorId || !perdedorId || ganadorId === perdedorId) {
+      const error = new Error('Resultado de clasificatoria inválido.');
+      error.status = 400; throw error;
+    }
+    return this.store.transaction(async () => {
+      const historyFile = await this.store.read('historial_clasificatoria.txt');
+      const history = Array.isArray(historyFile.data) ? historyFile.data : [];
+      const existente = history.find(item => item.matchId === matchId);
+      const rankingFile = await this.store.read('ranking.txt');
+      const ranking = Array.isArray(rankingFile.data) ? rankingFile.data : [];
+      const winner = ranking.find(row => row.userId === ganadorId);
+      const loser = ranking.find(row => row.userId === perdedorId);
+      if (!winner || !loser) {
+        const error = new Error('No se encontraron ambos jugadores en el ranking.');
+        error.status = 409; throw error;
+      }
+
+      // Los marcadores dentro de ranking.txt hacen que la operación sea
+      // idempotente incluso si GitHub falla entre la escritura de dos archivos.
+      winner.matchIds = Array.isArray(winner.matchIds) ? winner.matchIds : [];
+      loser.matchIds = Array.isArray(loser.matchIds) ? loser.matchIds : [];
+      const yaAplicado = winner.matchIds.includes(matchId) && loser.matchIds.includes(matchId);
+      if (!yaAplicado) {
+        if (!winner.matchIds.includes(matchId)) {
+          winner.puntos = Number(winner.puntos || 0) + 20;
+          winner.victorias = Number(winner.victorias || 0) + 1;
+          winner.matchIds.push(matchId);
+        }
+        if (!loser.matchIds.includes(matchId)) {
+          loser.puntos = Number(loser.puntos || 0) - 10;
+          loser.derrotas = Number(loser.derrotas || 0) + 1;
+          loser.matchIds.push(matchId);
+        }
+        await this.store.write('ranking.txt', ranking, rankingFile.sha);
+      }
+
+      let resultado = existente;
+      if (!existente) {
+        resultado = {
+          matchId, tipo: String(tipo || 'normal'), ganadorId, perdedorId,
+          puntosGanador: 20, puntosPerdedor: -10,
+          puntosActualesGanador: Number(winner.puntos || 0),
+          puntosActualesPerdedor: Number(loser.puntos || 0),
+          fecha: new Date().toISOString()
+        };
+        history.push(resultado);
+        await this.store.write('historial_clasificatoria.txt', history, historyFile.sha);
+      }
+      return { duplicado: !!existente || yaAplicado, resultado };
+    });
+  }
+
+  async registrarResultadoIA(matchId, userId, ganaste) {
+    if (!matchId || !userId || typeof ganaste !== 'boolean') {
+      const error = new Error('Resultado de partida contra IA inválido.');
+      error.status = 400; throw error;
+    }
+    return this.store.transaction(async () => {
+      const historyFile = await this.store.read('historial_clasificatoria.txt');
+      const history = Array.isArray(historyFile.data) ? historyFile.data : [];
+      const existente = history.find(item => item.matchId === matchId);
+      const rankingFile = await this.store.read('ranking.txt');
+      const ranking = Array.isArray(rankingFile.data) ? rankingFile.data : [];
+      const player = ranking.find(row => row.userId === userId);
+      if (!player) {
+        const error = new Error('No se encontró tu cuenta en el ranking.');
+        error.status = 404; throw error;
+      }
+      player.matchIds = Array.isArray(player.matchIds) ? player.matchIds : [];
+      const yaAplicado = player.matchIds.includes(matchId);
+      const delta = ganaste ? 20 : -10;
+      if (!yaAplicado) {
+        player.puntos = Number(player.puntos || 0) + delta;
+        if (ganaste) player.victorias = Number(player.victorias || 0) + 1;
+        else player.derrotas = Number(player.derrotas || 0) + 1;
+        player.matchIds.push(matchId);
+        await this.store.write('ranking.txt', ranking, rankingFile.sha);
+      }
+      let resultado = existente;
+      if (!existente) {
+        resultado = {
+          matchId, tipo: 'ia', jugadorId: userId,
+          resultado: ganaste ? 'victoria' : 'derrota',
+          puntos: delta, puntosActuales: Number(player.puntos || 0),
+          fecha: new Date().toISOString()
+        };
+        history.push(resultado);
+        await this.store.write('historial_clasificatoria.txt', history, historyFile.sha);
+      }
+      return { duplicado: !!existente || yaAplicado, puntosDelta: delta, puntosActuales: Number(player.puntos || 0), resultado };
+    });
+  }
+
   async getRanking() {
     const result = await this.store.read('ranking.txt');
-    return (Array.isArray(result.data) ? result.data : []).slice().sort((a, b) => (b.puntos || 0) - (a.puntos || 0));
+    return (Array.isArray(result.data) ? result.data : []).slice()
+      .sort((a, b) => (b.puntos || 0) - (a.puntos || 0))
+      .map(row => ({
+        userId: row.userId,
+        usuario: row.usuario,
+        nombrePersonaje: row.nombrePersonaje,
+        puntos: Number(row.puntos || 0),
+        rango: row.rango || 'Madera',
+        division: Number(row.division || 5),
+        victorias: Number(row.victorias || 0),
+        derrotas: Number(row.derrotas || 0),
+        empates: Number(row.empates || 0)
+      }));
   }
 }
 
